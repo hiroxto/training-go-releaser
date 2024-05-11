@@ -18,7 +18,6 @@ builds:
       - ppc64
     goarm:
       - "7"
-      - "8"
 
 checksum:
     name_template: 'checksums.txt'
