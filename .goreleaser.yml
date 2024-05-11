@@ -18,6 +18,9 @@ builds:
       - ppc64
     goarm:
       - "7"
+    ignore:
+      - goos: windows
+        goarch: arm
 
 checksum:
     name_template: 'checksums.txt'
