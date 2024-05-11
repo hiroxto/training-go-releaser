@@ -1,0 +1,2 @@
+# training-go-releaser
+GoReleaserのテスト
