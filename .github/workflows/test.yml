@@ -1,0 +1,99 @@
+name: Test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit or ref to verify (defaults to the event SHA)
+        type: string
+        required: false
+        default: ''
+    outputs:
+      sha:
+        description: Verified commit SHA
+        value: ${{ jobs.verify.outputs.sha }}
+      tag:
+        description: Verified stable tag, if a tag ref was supplied
+        value: ${{ jobs.verify.outputs.tag }}
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.verified.outputs.sha }}
+      tag: ${{ steps.target.outputs.tag }}
+    steps:
+      - name: Validate inputs and select target
+        id: target
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_BUMP: ${{ github.event.inputs.bump }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        shell: python
+        run: |
+          import os
+          import re
+
+          event = os.environ['GITHUB_EVENT_NAME']
+          ref = os.environ['GITHUB_REF']
+          target = os.environ['INPUT_REF'] or os.environ['GITHUB_SHA']
+          tag = ''
+          if event == 'workflow_dispatch':
+              if ref != 'refs/heads/main':
+                  raise SystemExit('Manual releases must run on main')
+              if not os.environ['INPUT_TAG']:
+                  if int(os.environ['GITHUB_RUN_ATTEMPT']) > 1:
+                      raise SystemExit('Start a new run; specify the existing tag after a tag was pushed')
+                  if os.environ['INPUT_BUMP'] not in ('patch', 'minor', 'major'):
+                      raise SystemExit('Invalid bump')
+          if target.startswith('refs/tags/'):
+              tag = target.removeprefix('refs/tags/')
+              if not re.fullmatch(r'v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', tag):
+                  raise SystemExit('Invalid release tag')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'ref={target}\ntag={tag}\n')
+
+      - name: Checkout target
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ steps.target.outputs.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.mod
+
+      - name: Check formatting
+        run: |
+          mapfile -d '' files < <(git ls-files -z '*.go')
+          unformatted=$(gofmt -l "${files[@]}")
+          if [[ -n "$unformatted" ]]; then
+            printf '%s\n' "$unformatted"
+            exit 1
+          fi
+
+      - name: Check dependencies
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+          test -z "$(git ls-files --others --exclude-standard -- go.mod go.sum)"
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+      - name: Record verified commit
+        id: verified
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"

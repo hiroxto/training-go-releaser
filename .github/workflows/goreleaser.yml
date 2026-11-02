@@ -1,9 +1,7 @@
-name: CI
+name: GoReleaser
 
 on:
-  pull_request:
   push:
-    branches: [main]
     tags: ['v[0-9]+.[0-9]+.[0-9]+']
   workflow_dispatch:
     inputs:
@@ -22,88 +20,15 @@ permissions:
 
 jobs:
   verify:
-    runs-on: ubuntu-latest
-    outputs:
-      sha: ${{ steps.verified.outputs.sha }}
-      tag: ${{ steps.target.outputs.tag }}
-    steps:
-      - name: Validate inputs and select target
-        id: target
-        env:
-          INPUT_BUMP: ${{ inputs.bump }}
-          INPUT_TAG: ${{ inputs.tag }}
-        shell: python
-        run: |
-          import os
-          import re
-
-          event = os.environ['GITHUB_EVENT_NAME']
-          ref = os.environ['GITHUB_REF']
-          tag = ''
-          target = os.environ['GITHUB_SHA']
-          if event == 'workflow_dispatch':
-              if ref != 'refs/heads/main':
-                  raise SystemExit('Manual releases must run on main')
-              tag = os.environ['INPUT_TAG']
-              if not tag:
-                  if int(os.environ['GITHUB_RUN_ATTEMPT']) > 1:
-                      raise SystemExit('Start a new run; specify the existing tag after a tag was pushed')
-                  if os.environ['INPUT_BUMP'] not in ('patch', 'minor', 'major'):
-                      raise SystemExit('Invalid bump')
-          elif event == 'push' and ref.startswith('refs/tags/'):
-              tag = ref.removeprefix('refs/tags/')
-          if tag:
-              if not re.fullmatch(r'v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', tag):
-                  raise SystemExit('Invalid release tag')
-              if event == 'workflow_dispatch':
-                  target = f'refs/tags/{tag}'
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
-              output.write(f'ref={target}\ntag={tag}\n')
-
-      - name: Checkout target
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          ref: ${{ steps.target.outputs.ref }}
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Record verified commit
-        id: verified
-        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-
-      - name: Set up Go
-        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
-        with:
-          go-version-file: go.mod
-          cache: true
-          cache-dependency-path: go.mod
-
-      - name: Check formatting
-        run: |
-          mapfile -d '' files < <(git ls-files -z '*.go')
-          unformatted=$(gofmt -l "${files[@]}")
-          if [[ -n "$unformatted" ]]; then
-            printf '%s\n' "$unformatted"
-            exit 1
-          fi
-
-      - name: Check dependencies
-        run: |
-          go mod tidy
-          git diff --exit-code -- go.mod go.sum
-          test -z "$(git ls-files --others --exclude-standard -- go.mod go.sum)"
-
-      - name: Vet
-        run: go vet ./...
-
-      - name: Test
-        run: go test ./...
+    uses: ./.github/workflows/test.yml
+    with:
+      ref: >-
+        ${{ github.event_name == 'workflow_dispatch' && inputs.tag != '' &&
+            format('refs/tags/{0}', inputs.tag) ||
+            (startsWith(github.ref, 'refs/tags/') && github.ref || github.sha) }}
 
   release:
     needs: verify
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/'))
     runs-on: ubuntu-latest
     permissions:
       contents: write
