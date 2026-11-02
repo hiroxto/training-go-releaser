@@ -1,0 +1,230 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version increment
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+      tag:
+        description: Existing release tag to retry (ignores bump)
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.verified.outputs.sha }}
+      tag: ${{ steps.target.outputs.tag }}
+    steps:
+      - name: Validate inputs and select target
+        id: target
+        env:
+          INPUT_BUMP: ${{ inputs.bump }}
+          INPUT_TAG: ${{ inputs.tag }}
+        shell: python
+        run: |
+          import os
+          import re
+
+          event = os.environ['GITHUB_EVENT_NAME']
+          ref = os.environ['GITHUB_REF']
+          tag = ''
+          target = os.environ['GITHUB_SHA']
+          if event == 'workflow_dispatch':
+              if ref != 'refs/heads/main':
+                  raise SystemExit('Manual releases must run on main')
+              tag = os.environ['INPUT_TAG']
+              if not tag:
+                  if int(os.environ['GITHUB_RUN_ATTEMPT']) > 1:
+                      raise SystemExit('Start a new run; specify the existing tag after a tag was pushed')
+                  if os.environ['INPUT_BUMP'] not in ('patch', 'minor', 'major'):
+                      raise SystemExit('Invalid bump')
+          elif event == 'push' and ref.startswith('refs/tags/'):
+              tag = ref.removeprefix('refs/tags/')
+          if tag:
+              if not re.fullmatch(r'v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', tag):
+                  raise SystemExit('Invalid release tag')
+              if event == 'workflow_dispatch':
+                  target = f'refs/tags/{tag}'
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'ref={target}\ntag={tag}\n')
+
+      - name: Checkout target
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ steps.target.outputs.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Record verified commit
+        id: verified
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.mod
+
+      - name: Check formatting
+        run: |
+          mapfile -d '' files < <(git ls-files -z '*.go')
+          unformatted=$(gofmt -l "${files[@]}")
+          if [[ -n "$unformatted" ]]; then
+            printf '%s\n' "$unformatted"
+            exit 1
+          fi
+
+      - name: Check dependencies
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+          test -z "$(git ls-files --others --exclude-standard -- go.mod go.sum)"
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+  release:
+    needs: verify
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: release
+      cancel-in-progress: false
+      queue: max
+    steps:
+      - name: Checkout verified commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.verify.outputs.sha }}
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.mod
+
+      - name: Prepare release tag
+        id: release
+        env:
+          VERIFIED_SHA: ${{ needs.verify.outputs.sha }}
+          VERIFIED_TAG: ${{ needs.verify.outputs.tag }}
+          INPUT_BUMP: ${{ inputs.bump }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: python
+        run: |
+          import json
+          import os
+          import re
+          import subprocess
+          import urllib.request
+
+          def git(*args):
+              return subprocess.check_output(['git', *args], text=True).strip()
+
+          if (os.environ['GITHUB_EVENT_NAME'] == 'workflow_dispatch'
+                  and not os.environ['VERIFIED_TAG']
+                  and int(os.environ['GITHUB_RUN_ATTEMPT']) > 1):
+              raise SystemExit('Start a new run with the existing tag; new releases cannot be rerun')
+          sha = os.environ['VERIFIED_SHA']
+          if git('rev-parse', 'HEAD') != sha:
+              raise SystemExit('Checkout does not match the verified commit')
+          git('fetch', '--force', '--prune', 'origin', '+refs/tags/*:refs/tags/*')
+          pattern = r'v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
+          tags = git('tag', '--list').splitlines()
+          tag = os.environ['VERIFIED_TAG']
+          existing = bool(tag)
+          if existing:
+              if not re.fullmatch(pattern, tag):
+                  raise SystemExit('Invalid release tag')
+              if git('rev-parse', f'refs/tags/{tag}^{{commit}}') != sha:
+                  raise SystemExit('Remote tag no longer matches the verified commit')
+          else:
+              versions = [tuple(map(int, match.groups())) for item in tags
+                          if (match := re.fullmatch(pattern, item))]
+              if not versions:
+                  raise SystemExit('No stable version tag exists')
+              major, minor, patch = max(versions)
+              bump = os.environ['INPUT_BUMP']
+              if bump == 'patch':
+                  patch += 1
+              elif bump == 'minor':
+                  minor, patch = minor + 1, 0
+              elif bump == 'major':
+                  major, minor, patch = major + 1, 0, 0
+              else:
+                  raise SystemExit('Invalid bump')
+              tag = f'v{major}.{minor}.{patch}'
+              if tag in tags:
+                  raise SystemExit(f'Tag already exists: {tag}')
+
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write(f'Commit: `{sha}`\n\nTag: `{tag}`\n\nVersion: `{tag[1:]}`\n\n')
+              summary.write(f'If publication fails after pushing the tag, start a new run with tag `{tag}`. '
+                            'Inspect and delete any draft release before retrying.\n\n')
+          page = 1
+          while True:
+              request = urllib.request.Request(
+                  f"{os.environ['GITHUB_API_URL']}/repos/{os.environ['GITHUB_REPOSITORY']}/releases?per_page=100&page={page}",
+                  headers={'Authorization': f"Bearer {os.environ['GH_TOKEN']}",
+                           'Accept': 'application/vnd.github+json'})
+              with urllib.request.urlopen(request) as response:
+                  releases = json.load(response)
+              for release in releases:
+                  if release['tag_name'] == tag:
+                      state = 'Draft' if release['draft'] else 'Published'
+                      raise SystemExit(f"{state} release already exists: {release['html_url']}")
+              if len(releases) < 100:
+                  break
+              page += 1
+          if not existing:
+              git('tag', tag, sha)
+              git('push', 'origin', f'refs/tags/{tag}')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'tag={tag}\n')
+
+      - name: Confirm remote tag before publication
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          VERIFIED_SHA: ${{ needs.verify.outputs.sha }}
+        run: |
+          git fetch --force origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$VERIFIED_SHA"
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@5742e2a039330cbb23ebf35f046f814d4c6ff811 # v5
+        with:
+          version: latest
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GORELEASER_CURRENT_TAG: ${{ steps.release.outputs.tag }}
+
+      - name: Record published release
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          url=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json url --jq .url)
+          printf 'Release: %s\n' "$url" >> "$GITHUB_STEP_SUMMARY"
