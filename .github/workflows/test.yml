@@ -35,29 +35,30 @@ jobs:
           INPUT_REF: ${{ inputs.ref }}
           INPUT_BUMP: ${{ github.event.inputs.bump }}
           INPUT_TAG: ${{ github.event.inputs.tag }}
-        shell: python
+        shell: bash
         run: |
-          import os
-          import re
+          set -euo pipefail
 
-          event = os.environ['GITHUB_EVENT_NAME']
-          ref = os.environ['GITHUB_REF']
-          target = os.environ['INPUT_REF'] or os.environ['GITHUB_SHA']
-          tag = ''
-          if event == 'workflow_dispatch':
-              if ref != 'refs/heads/main':
-                  raise SystemExit('Manual releases must run on main')
-              if not os.environ['INPUT_TAG']:
-                  if int(os.environ['GITHUB_RUN_ATTEMPT']) > 1:
-                      raise SystemExit('Start a new run; specify the existing tag after a tag was pushed')
-                  if os.environ['INPUT_BUMP'] not in ('patch', 'minor', 'major'):
-                      raise SystemExit('Invalid bump')
-          if target.startswith('refs/tags/'):
-              tag = target.removeprefix('refs/tags/')
-              if not re.fullmatch(r'v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', tag):
-                  raise SystemExit('Invalid release tag')
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
-              output.write(f'ref={target}\ntag={tag}\n')
+          fail() { echo "$*" >&2; exit 1; }
+
+          target=${INPUT_REF:-$GITHUB_SHA}
+          tag=''
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            [[ "$GITHUB_REF" == refs/heads/main ]] || fail 'Manual releases must run on main'
+            if [[ -z "$INPUT_TAG" ]]; then
+              [[ "$GITHUB_RUN_ATTEMPT" == 1 ]] || fail 'Start a new run; specify the existing tag after a tag was pushed'
+              case "$INPUT_BUMP" in
+                patch|minor|major) ;;
+                *) fail 'Invalid bump' ;;
+              esac
+            fi
+          fi
+          if [[ "$target" == refs/tags/* ]]; then
+            tag=${target#refs/tags/}
+            pattern='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+            [[ "$tag" =~ $pattern ]] || fail 'Invalid release tag'
+          fi
+          printf 'ref=%s\ntag=%s\n' "$target" "$tag" >> "$GITHUB_OUTPUT"
 
       - name: Checkout target
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4

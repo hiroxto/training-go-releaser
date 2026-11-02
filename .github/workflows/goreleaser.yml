@@ -57,77 +57,65 @@ jobs:
           VERIFIED_TAG: ${{ needs.verify.outputs.tag }}
           INPUT_BUMP: ${{ inputs.bump }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: python
+        shell: bash
         run: |
-          import json
-          import os
-          import re
-          import subprocess
-          import urllib.request
+          set -euo pipefail
 
-          def git(*args):
-              return subprocess.check_output(['git', *args], text=True).strip()
+          fail() { echo "$*" >&2; exit 1; }
 
-          if (os.environ['GITHUB_EVENT_NAME'] == 'workflow_dispatch'
-                  and not os.environ['VERIFIED_TAG']
-                  and int(os.environ['GITHUB_RUN_ATTEMPT']) > 1):
-              raise SystemExit('Start a new run with the existing tag; new releases cannot be rerun')
-          sha = os.environ['VERIFIED_SHA']
-          if git('rev-parse', 'HEAD') != sha:
-              raise SystemExit('Checkout does not match the verified commit')
-          git('fetch', '--force', '--prune', 'origin', '+refs/tags/*:refs/tags/*')
-          pattern = r'v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
-          tags = git('tag', '--list').splitlines()
-          tag = os.environ['VERIFIED_TAG']
-          existing = bool(tag)
-          if existing:
-              if not re.fullmatch(pattern, tag):
-                  raise SystemExit('Invalid release tag')
-              if git('rev-parse', f'refs/tags/{tag}^{{commit}}') != sha:
-                  raise SystemExit('Remote tag no longer matches the verified commit')
-          else:
-              versions = [tuple(map(int, match.groups())) for item in tags
-                          if (match := re.fullmatch(pattern, item))]
-              if not versions:
-                  raise SystemExit('No stable version tag exists')
-              major, minor, patch = max(versions)
-              bump = os.environ['INPUT_BUMP']
-              if bump == 'patch':
-                  patch += 1
-              elif bump == 'minor':
-                  minor, patch = minor + 1, 0
-              elif bump == 'major':
-                  major, minor, patch = major + 1, 0, 0
-              else:
-                  raise SystemExit('Invalid bump')
-              tag = f'v{major}.{minor}.{patch}'
-              if tag in tags:
-                  raise SystemExit(f'Tag already exists: {tag}')
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && -z "$VERIFIED_TAG" && "$GITHUB_RUN_ATTEMPT" != 1 ]]; then
+            fail 'Start a new run with the existing tag; new releases cannot be rerun'
+          fi
+          [[ "$(git rev-parse HEAD)" == "$VERIFIED_SHA" ]] || fail 'Checkout does not match the verified commit'
+          git fetch --force --prune origin '+refs/tags/*:refs/tags/*'
+          pattern='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          tag=$VERIFIED_TAG
+          if [[ -n "$tag" ]]; then
+            [[ "$tag" =~ $pattern ]] || fail 'Invalid release tag'
+            [[ "$(git rev-parse "refs/tags/$tag^{commit}")" == "$VERIFIED_SHA" ]] || fail 'Remote tag no longer matches the verified commit'
+          else
+            latest=''
+            tags=$(git tag --list --sort=-version:refname)
+            while IFS= read -r candidate; do
+              if [[ "$candidate" =~ $pattern ]]; then
+                latest=$candidate
+                break
+              fi
+            done <<< "$tags"
+            [[ -n "$latest" ]] || fail 'No stable version tag exists'
+            IFS=. read -r major minor patch <<< "${latest#v}"
+            case "$INPUT_BUMP" in
+              patch) patch=$((patch + 1)) ;;
+              minor) minor=$((minor + 1)); patch=0 ;;
+              major) major=$((major + 1)); minor=0; patch=0 ;;
+              *) fail 'Invalid bump' ;;
+            esac
+            tag="v$major.$minor.$patch"
+            if git show-ref --verify --quiet "refs/tags/$tag"; then
+              fail "Tag already exists: $tag"
+            fi
+          fi
 
-          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
-              summary.write(f'Commit: `{sha}`\n\nTag: `{tag}`\n\nVersion: `{tag[1:]}`\n\n')
-              summary.write(f'If publication fails after pushing the tag, start a new run with tag `{tag}`. '
-                            'Inspect and delete any draft release before retrying.\n\n')
-          page = 1
-          while True:
-              request = urllib.request.Request(
-                  f"{os.environ['GITHUB_API_URL']}/repos/{os.environ['GITHUB_REPOSITORY']}/releases?per_page=100&page={page}",
-                  headers={'Authorization': f"Bearer {os.environ['GH_TOKEN']}",
-                           'Accept': 'application/vnd.github+json'})
-              with urllib.request.urlopen(request) as response:
-                  releases = json.load(response)
-              for release in releases:
-                  if release['tag_name'] == tag:
-                      state = 'Draft' if release['draft'] else 'Published'
-                      raise SystemExit(f"{state} release already exists: {release['html_url']}")
-              if len(releases) < 100:
-                  break
-              page += 1
-          if not existing:
-              git('tag', tag, sha)
-              git('push', 'origin', f'refs/tags/{tag}')
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
-              output.write(f'tag={tag}\n')
+          {
+            printf 'Commit: `%s`\n\nTag: `%s`\n\nVersion: `%s`\n\n' "$VERIFIED_SHA" "$tag" "${tag#v}"
+            printf 'If publication fails after pushing the tag, start a new run with tag `%s`. Inspect and delete any draft release before retrying.\n\n' "$tag"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          releases=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | [.tag_name, .draft, .html_url] | @tsv')
+          while IFS=$'\t' read -r existing_tag draft url; do
+            if [[ "$existing_tag" == "$tag" ]]; then
+              state=Published
+              [[ "$draft" != true ]] || state=Draft
+              fail "$state release already exists: $url"
+            fi
+          done <<< "$releases"
+
+          if [[ -z "$VERIFIED_TAG" ]]; then
+            git tag "$tag" "$VERIFIED_SHA"
+            git push origin "refs/tags/$tag"
+          fi
+          printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
 
       - name: Confirm remote tag before publication
         env:
