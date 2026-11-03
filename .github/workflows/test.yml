@@ -23,10 +23,10 @@ permissions:
   contents: read
 
 jobs:
-  verify:
+  prepare:
     runs-on: ubuntu-latest
     outputs:
-      sha: ${{ steps.verified.outputs.sha }}
+      sha: ${{ steps.target-commit.outputs.sha }}
       tag: ${{ steps.target.outputs.tag }}
     steps:
       - name: Validate inputs and select target
@@ -66,33 +66,102 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Set up Go
-        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+      - name: Record target commit
+        id: target-commit
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  gofmt:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout target
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          go-version-file: go.mod
-          cache: true
-          cache-dependency-path: go.mod
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+
+      - name: Set up mise
+        uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c # v5.2.6
 
       - name: Check formatting
-        run: |
-          mapfile -d '' files < <(git ls-files -z '*.go')
-          unformatted=$(gofmt -l "${files[@]}")
-          if [[ -n "$unformatted" ]]; then
-            printf '%s\n' "$unformatted"
-            exit 1
-          fi
+        run: mise run fmt:check
+
+  dependencies:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout target
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+
+      - name: Set up mise
+        uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c # v5.2.6
 
       - name: Check dependencies
-        run: |
-          go mod tidy
-          git diff --exit-code -- go.mod go.sum
-          test -z "$(git ls-files --others --exclude-standard -- go.mod go.sum)"
+        run: mise run deps:check
+
+  vet:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout target
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+
+      - name: Set up mise
+        uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c # v5.2.6
 
       - name: Vet
-        run: go vet ./...
+        run: mise run vet
+
+  test:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout target
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+
+      - name: Set up mise
+        uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c # v5.2.6
 
       - name: Test
-        run: go test ./...
+        run: mise run test
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout target
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+
+      - name: Set up mise
+        uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c # v5.2.6
+
+      - name: Build
+        run: mise run build
+
+  goreleaser-check:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout target
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+
+      - name: Set up mise
+        uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c # v5.2.6
 
       - name: Check GoReleaser configuration
         uses: goreleaser/goreleaser-action@5742e2a039330cbb23ebf35f046f814d4c6ff811 # v5
@@ -100,6 +169,15 @@ jobs:
           version: ~> v2
           args: check
 
-      - name: Record verified commit
-        id: verified
-        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+  verify:
+    if: ${{ always() }}
+    needs: [prepare, gofmt, dependencies, vet, test, build, goreleaser-check]
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ needs.prepare.outputs.sha }}
+      tag: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - name: Require all checks to succeed
+        env:
+          CHECK_RESULTS: ${{ toJSON(needs) }}
+        run: jq -e 'all(.[]; .result == "success")' <<< "$CHECK_RESULTS"
