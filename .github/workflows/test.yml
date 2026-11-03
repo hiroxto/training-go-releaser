@@ -1,0 +1,99 @@
+name: Test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit or ref to verify (defaults to the event SHA)
+        type: string
+        required: false
+        default: ''
+    outputs:
+      sha:
+        description: Verified commit SHA
+        value: ${{ jobs.verify.outputs.sha }}
+      tag:
+        description: Release tag, or empty for a normal test run
+        value: ${{ jobs.verify.outputs.tag }}
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.verified.outputs.sha }}
+      tag: ${{ steps.target.outputs.tag }}
+    steps:
+      - name: Validate inputs and select target
+        id: target
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          fail() { echo "$*" >&2; exit 1; }
+
+          target=${INPUT_REF:-$GITHUB_SHA}
+          tag=''
+          pattern='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            [[ "$GITHUB_REF" == refs/heads/main ]] || fail 'Manual releases must run on main'
+            tag=$INPUT_TAG
+            [[ "$tag" =~ $pattern ]] || fail 'Invalid release tag'
+            existing_ref=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$tag" \
+              --jq ".[] | select(.ref == \"refs/tags/$tag\") | .ref")
+            if [[ -n "$existing_ref" ]]; then
+              target=$existing_ref
+            fi
+          elif [[ "$target" == refs/tags/* ]]; then
+            tag=${target#refs/tags/}
+            [[ "$tag" =~ $pattern ]] || fail 'Invalid release tag'
+          fi
+          printf 'ref=%s\ntag=%s\n' "$target" "$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout target
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ steps.target.outputs.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.mod
+
+      - name: Check formatting
+        run: |
+          mapfile -d '' files < <(git ls-files -z '*.go')
+          unformatted=$(gofmt -l "${files[@]}")
+          if [[ -n "$unformatted" ]]; then
+            printf '%s\n' "$unformatted"
+            exit 1
+          fi
+
+      - name: Check dependencies
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+          test -z "$(git ls-files --others --exclude-standard -- go.mod go.sum)"
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+      - name: Record verified commit
+        id: verified
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
