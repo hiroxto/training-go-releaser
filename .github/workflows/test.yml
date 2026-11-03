@@ -94,6 +94,12 @@ jobs:
       - name: Test
         run: go test ./...
 
+      - name: Check GoReleaser configuration
+        uses: goreleaser/goreleaser-action@5742e2a039330cbb23ebf35f046f814d4c6ff811 # v5
+        with:
+          version: ~> v2
+          args: check
+
       - name: Record verified commit
         id: verified
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
