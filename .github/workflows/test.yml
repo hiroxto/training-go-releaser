@@ -16,7 +16,7 @@ on:
         description: Verified commit SHA
         value: ${{ jobs.verify.outputs.sha }}
       tag:
-        description: Verified stable tag, if a tag ref was supplied
+        description: Release tag, or empty for a normal test run
         value: ${{ jobs.verify.outputs.tag }}
 
 permissions:
@@ -33,8 +33,8 @@ jobs:
         id: target
         env:
           INPUT_REF: ${{ inputs.ref }}
-          INPUT_BUMP: ${{ github.event.inputs.bump }}
           INPUT_TAG: ${{ github.event.inputs.tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
@@ -43,19 +43,18 @@ jobs:
 
           target=${INPUT_REF:-$GITHUB_SHA}
           tag=''
+          pattern='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
           if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
             [[ "$GITHUB_REF" == refs/heads/main ]] || fail 'Manual releases must run on main'
-            if [[ -z "$INPUT_TAG" ]]; then
-              [[ "$GITHUB_RUN_ATTEMPT" == 1 ]] || fail 'Start a new run; specify the existing tag after a tag was pushed'
-              case "$INPUT_BUMP" in
-                patch|minor|major) ;;
-                *) fail 'Invalid bump' ;;
-              esac
+            tag=$INPUT_TAG
+            [[ "$tag" =~ $pattern ]] || fail 'Invalid release tag'
+            existing_ref=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$tag" \
+              --jq ".[] | select(.ref == \"refs/tags/$tag\") | .ref")
+            if [[ -n "$existing_ref" ]]; then
+              target=$existing_ref
             fi
-          fi
-          if [[ "$target" == refs/tags/* ]]; then
+          elif [[ "$target" == refs/tags/* ]]; then
             tag=${target#refs/tags/}
-            pattern='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
             [[ "$tag" =~ $pattern ]] || fail 'Invalid release tag'
           fi
           printf 'ref=%s\ntag=%s\n' "$target" "$tag" >> "$GITHUB_OUTPUT"
