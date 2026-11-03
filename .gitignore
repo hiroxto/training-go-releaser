@@ -20,4 +20,4 @@
 # Go workspace file
 go.work
 
-./training-go-releaser
+/training-go-releaser
