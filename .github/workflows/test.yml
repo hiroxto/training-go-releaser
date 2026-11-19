@@ -82,6 +82,10 @@ jobs:
 
       - name: Set up mise
         uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c # v5.2.6
+        with:
+          # 既定のキャッシュキーはmiseの設定ファイルのハッシュだけで決まり、idiomatic_version_file_enable_toolsで読むgo.modを含まない。go.modのGoのバージョンを上げても古いキャッシュが復元されるため、go.modのハッシュを加える
+          # Renovateがmise.lockの更新に対応していないため、mise.lockでバージョンを固定せず、バージョンを指定するファイルをキャッシュキーに含める
+          cache_key: &mise-cache-key "{{default}}-${{ hashFiles('go.mod') }}"
 
       - name: Check formatting
         run: mise run fmt:check
@@ -98,6 +102,8 @@ jobs:
 
       - name: Set up mise
         uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c # v5.2.6
+        with:
+          cache_key: *mise-cache-key
 
       - name: Check dependencies
         run: mise run deps:check
@@ -114,6 +120,8 @@ jobs:
 
       - name: Set up mise
         uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c # v5.2.6
+        with:
+          cache_key: *mise-cache-key
 
       - name: Vet
         run: mise run vet
@@ -130,6 +138,8 @@ jobs:
 
       - name: Set up mise
         uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c # v5.2.6
+        with:
+          cache_key: *mise-cache-key
 
       - name: Test
         run: mise run test
@@ -146,6 +156,8 @@ jobs:
 
       - name: Set up mise
         uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c # v5.2.6
+        with:
+          cache_key: *mise-cache-key
 
       - name: Build
         run: mise run build
@@ -162,6 +174,8 @@ jobs:
 
       - name: Set up mise
         uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c # v5.2.6
+        with:
+          cache_key: *mise-cache-key
 
       - name: Check GoReleaser configuration
         uses: goreleaser/goreleaser-action@5742e2a039330cbb23ebf35f046f814d4c6ff811 # v5
